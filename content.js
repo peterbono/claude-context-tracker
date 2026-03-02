@@ -16,32 +16,31 @@ var estTokens = 0, pct = 0, msgCount = 0;
 var summaryDone = false, lastConvId = null;
 var minimized = false, expanded = false, uiOk = false;
 
+// ── Credits State ──
+var creditsData = null;
+var creditsPrevRemaining = null;
+var creditsConnected = false;
+var sessionMessages = 0;
+var lastMsgCount = 0;
+
 // ═══════════════════════════════════════════════════════════════
 // TOKEN ESTIMATION - using actual claude.ai data-testid selectors
 // ═══════════════════════════════════════════════════════════════
 function getMessages() {
   var msgs = [];
   try {
-    // Primary: user-message data-testid (confirmed from live DOM)
     var userMsgs = document.querySelectorAll('[data-testid="user-message"]');
-
-    // Assistant messages: siblings/adjacent to user messages in the conversation flow
-    // Claude wraps assistant responses in .prose or grid containers after user messages
     var assistantMsgs = document.querySelectorAll(
-      // Assistant message blocks (response content area)
       '[class*="font-claude"], .prose, [data-testid="chat-message-text"]'
     );
 
-    // Gather user messages
     for (var i = 0; i < userMsgs.length; i++) {
       var t = (userMsgs[i].innerText || '').trim();
       if (t) msgs.push({ role: 'human', text: t });
     }
 
-    // Gather assistant messages - filter out non-conversation prose
     for (var j = 0; j < assistantMsgs.length; j++) {
       var el = assistantMsgs[j];
-      // Only count if it's inside the main conversation area
       if (el.closest('main') || el.closest('[role="main"]')) {
         var t2 = (el.innerText || '').trim();
         if (t2 && t2.length > 5) msgs.push({ role: 'assistant', text: t2 });
@@ -50,10 +49,8 @@ function getMessages() {
 
     if (msgs.length > 0) return msgs;
 
-    // Fallback: grab everything from main
     var main = document.querySelector('main') || document.querySelector('[role="main"]');
     if (main) {
-      // Look for any substantial text blocks
       var blocks = main.querySelectorAll('article, [class*="Message"], [class*="message"], .prose, [data-testid*="message"]');
       for (var k = 0; k < blocks.length; k++) {
         var t3 = (blocks[k].innerText || '').trim();
@@ -70,7 +67,6 @@ function estimate() {
   var msgs = getMessages();
   var seen = {}, chars = 0, count = 0;
   for (var i = 0; i < msgs.length; i++) {
-    // Dedup by first 120 chars
     var key = msgs[i].text.substring(0, 120);
     if (!seen[key]) {
       seen[key] = true;
@@ -78,13 +74,8 @@ function estimate() {
       count++;
     }
   }
-  // Only add system overhead if there's actual conversation content
   var tokens = count > 0 ? Math.ceil(chars / CHARS_PER_TOKEN) + OVERHEAD : 0;
-  return {
-    tokens: tokens,
-    count: count,
-    chars: chars
-  };
+  return { tokens: tokens, count: count, chars: chars };
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -152,15 +143,14 @@ function cpSummary() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// UI - Claude native design
+// UI HELPERS
 // ═══════════════════════════════════════════════════════════════
 function getColor(p) {
-  // Claude-native palette: terracotta progression
-  if (p < T_GREEN) return '#8B9A6B';    // sage green - plenty of room
-  if (p < T_YELLOW) return '#B8976A';    // warm gold
-  if (p < T_ORANGE) return '#C17A4A';    // warm amber
-  if (p < T_RED) return '#C15F3C';       // Claude terracotta
-  return '#A8403A';                       // deep terracotta
+  if (p < T_GREEN) return '#8B9A6B';
+  if (p < T_YELLOW) return '#B8976A';
+  if (p < T_ORANGE) return '#C17A4A';
+  if (p < T_RED) return '#C15F3C';
+  return '#A8403A';
 }
 
 function toast(msg) {
@@ -173,6 +163,207 @@ function toast(msg) {
   setTimeout(function () { if (el.parentNode) el.remove(); }, 2500);
 }
 
+// ═══════════════════════════════════════════════════════════════
+// CREDITS TRACKING
+// ═══════════════════════════════════════════════════════════════
+function detectModel() {
+  try {
+    var btn = document.querySelector('[data-testid="model-selector-dropdown"]');
+    if (btn) return (btn.textContent || '').trim();
+  } catch (e) {}
+  return null;
+}
+
+function getCreditsColor(remainingPct) {
+  if (remainingPct > 70) return '#8B9A6B';
+  if (remainingPct > 40) return '#B8976A';
+  if (remainingPct > 20) return '#C17A4A';
+  if (remainingPct > 5) return '#C15F3C';
+  return '#A8403A';
+}
+
+function refreshCredits(data) {
+  if (!uiOk) return;
+  creditsData = data;
+
+  var dot = document.getElementById('cct-credits-dot');
+  var pctEl = document.getElementById('cct-credits-pct');
+  var resetEl = document.getElementById('cct-credits-reset');
+  var barFill = document.getElementById('cct-credits-bar-fill');
+
+  if (!dot || !pctEl || !resetEl || !barFill) return;
+
+  // No API data yet
+  if (!data || data.percentUsed === null) {
+    if (!creditsConnected) {
+      pctEl.textContent = sessionMessages > 0
+        ? sessionMessages + ' messages this session'
+        : 'Connecting...';
+      dot.className = 'cct-dot cct-dot-pending';
+      barFill.style.width = '0%';
+      resetEl.textContent = '';
+    }
+    return;
+  }
+
+  creditsConnected = true;
+  dot.className = 'cct-dot cct-dot-live';
+
+  var remaining = data.percentRemaining !== null
+    ? data.percentRemaining
+    : (100 - Math.min(100, Math.max(0, data.percentUsed)));
+  remaining = Math.min(100, Math.max(0, remaining));
+
+  var c = getCreditsColor(remaining);
+
+  // Check for recharge (remaining jumps from low to high)
+  if (creditsPrevRemaining !== null && creditsPrevRemaining < 30 && remaining > 70) {
+    celebrateRecharge();
+  }
+  creditsPrevRemaining = remaining;
+
+  // Animate the bar (shows remaining credits)
+  barFill.style.width = remaining + '%';
+  barFill.style.background = c;
+
+  // Update text
+  if (data.messagesRemaining !== null && data.messagesLimit !== null) {
+    pctEl.textContent = data.messagesRemaining + '/' + data.messagesLimit + ' remaining';
+  } else {
+    pctEl.textContent = remaining + '% remaining';
+  }
+  pctEl.style.color = c;
+
+  // Reset timer
+  if (data.resetAt) {
+    updateResetTimer(data.resetAt);
+  } else if (data.resetSeconds && data.lastUpdated) {
+    var resetTime = new Date(data.lastUpdated + data.resetSeconds * 1000);
+    updateResetTimer(resetTime.toISOString());
+  } else {
+    resetEl.textContent = '';
+  }
+}
+
+function updateResetTimer(isoDate) {
+  var resetEl = document.getElementById('cct-credits-reset');
+  if (!resetEl) return;
+
+  var target = new Date(isoDate).getTime();
+  var now = Date.now();
+  var diff = Math.max(0, target - now);
+
+  if (diff <= 0) {
+    resetEl.textContent = '';
+    return;
+  }
+
+  var h = Math.floor(diff / 3600000);
+  var m = Math.floor((diff % 3600000) / 60000);
+
+  if (h > 0) {
+    resetEl.textContent = '\u21bb ' + h + 'h ' + m + 'm';
+  } else if (m > 0) {
+    resetEl.textContent = '\u21bb ' + m + 'min';
+  } else {
+    resetEl.textContent = '\u21bb <1min';
+  }
+}
+
+function detectRateLimitDOM() {
+  try {
+    var main = document.querySelector('main') || document.body;
+    var text = (main.innerText || '').toLowerCase();
+
+    if (text.includes('message limit') || text.includes('usage limit') ||
+        text.includes('try again in') || text.includes('rate limit') ||
+        text.includes('too many messages')) {
+      var match = text.match(/try again in (\d+)\s*(hour|minute|min|h|m)/i);
+      var secs = null;
+      if (match) {
+        var val = parseInt(match[1]);
+        var unit = match[2].toLowerCase();
+        secs = unit.startsWith('h') ? val * 3600 : val * 60;
+      }
+
+      try {
+        chrome.runtime.sendMessage({
+          type: 'CCT_RATE_LIMITED',
+          resetSeconds: secs
+        });
+      } catch (e) {}
+
+      return { rateLimited: true, resetSeconds: secs };
+    }
+  } catch (e) {}
+  return null;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CELEBRATION ANIMATION (Cursor-style micro-interactions)
+// ═══════════════════════════════════════════════════════════════
+function celebrateRecharge() {
+  if (!uiOk) return;
+
+  var credits = document.getElementById('cct-credits');
+  if (!credits) return;
+
+  // Glow effect on section
+  credits.classList.add('cct-celebrating');
+
+  // Show "Recharged" label
+  var recharged = document.getElementById('cct-recharged');
+  if (recharged) recharged.classList.add('show');
+
+  // Sparkle particles
+  for (var i = 0; i < 8; i++) {
+    createSparkle(credits, i);
+  }
+
+  // Clean up after animation
+  setTimeout(function () {
+    credits.classList.remove('cct-celebrating');
+    if (recharged) recharged.classList.remove('show');
+  }, 2500);
+
+  toast('Credits recharged \u2728');
+}
+
+function createSparkle(parent, index) {
+  var el = document.createElement('div');
+  el.className = 'cct-sparkle';
+
+  // Random upward direction with spread
+  var angle = -Math.PI / 2 + (Math.random() - 0.5) * Math.PI * 0.8;
+  var distance = 25 + Math.random() * 35;
+  var endX = Math.cos(angle) * distance;
+  var endY = Math.sin(angle) * distance;
+
+  // Palette colors
+  var colors = ['#D4A574', '#C15F3C', '#8B9A6B', '#B8976A', '#E8C5A0', '#A8403A'];
+  el.style.background = colors[index % colors.length];
+
+  // Random position along section width
+  el.style.left = (Math.random() * 100) + '%';
+  el.style.top = '50%';
+  el.style.setProperty('--sparkle-x', endX + 'px');
+  el.style.setProperty('--sparkle-y', endY + 'px');
+
+  // Size variation
+  var size = 3 + Math.random() * 4;
+  el.style.width = size + 'px';
+  el.style.height = size + 'px';
+
+  // Stagger timing
+  el.style.animationDelay = (index * 0.07) + 's';
+
+  parent.appendChild(el);
+  setTimeout(function () { if (el.parentNode) el.remove(); }, 2000);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// UI - Claude native design
+// ═══════════════════════════════════════════════════════════════
 function buildUI() {
   if (uiOk || document.getElementById('cct-root')) return;
   if (!document.body) return;
@@ -195,9 +386,22 @@ function buildUI() {
         '<div id="cct-pct" style="color:#8B9A6B">0%</div>' +
         '<div id="cct-sub">Estimating...</div>' +
         '<div id="cct-bar-bg"><div id="cct-bar-fill" style="width:0%;background:#8B9A6B"></div></div>' +
+        '<div id="cct-credits">' +
+          '<div id="cct-credits-head">' +
+            '<span class="cct-section-label">Credits</span>' +
+            '<span id="cct-credits-dot" class="cct-dot cct-dot-pending"></span>' +
+          '</div>' +
+          '<div id="cct-credits-bar-bg"><div id="cct-credits-bar-fill"></div></div>' +
+          '<div id="cct-credits-info">' +
+            '<span id="cct-credits-pct">Connecting...</span>' +
+            '<span id="cct-credits-reset"></span>' +
+          '</div>' +
+          '<div id="cct-recharged">Recharged \u2726</div>' +
+        '</div>' +
         '<div id="cct-extra">' +
           '<div><span>Tokens (est.)</span><span id="cct-tok">0</span></div>' +
           '<div><span>Messages</span><span id="cct-msg">0</span></div>' +
+          '<div><span>Model</span><span id="cct-model">\u2014</span></div>' +
           '<div><span>Max</span><span>200K</span></div>' +
         '</div>' +
         '<div id="cct-btns">' +
@@ -300,6 +504,11 @@ function refresh(tokens, p, count) {
     document.getElementById('cct-tok').textContent = tokens.toLocaleString();
     document.getElementById('cct-msg').textContent = count;
 
+    // Model info
+    var modelEl = document.getElementById('cct-model');
+    var model = detectModel();
+    if (model && modelEl) modelEl.textContent = model;
+
     // Subtle border glow at high usage
     var box = document.getElementById('cct-box');
     box.style.borderColor = p > T_ORANGE
@@ -333,14 +542,40 @@ function tick() {
     // Detect conversation change
     var m = location.href.match(/\/chat\/([a-f0-9-]+)/i);
     var cid = m ? m[1] : null;
-    if (cid !== lastConvId) { lastConvId = cid; summaryDone = false; }
+    if (cid !== lastConvId) {
+      lastConvId = cid;
+      summaryDone = false;
+      if (cid) sessionMessages = 0;
+    }
 
     var d = estimate();
     estTokens = d.tokens;
     pct = (d.tokens / MAX_TOKENS) * 100;
     msgCount = d.count;
 
+    // Track session messages (count new user messages)
+    if (d.count > lastMsgCount && lastMsgCount > 0) {
+      sessionMessages += (d.count - lastMsgCount);
+    }
+    lastMsgCount = d.count;
+
     refresh(d.tokens, pct, d.count);
+
+    // Update credits with session count when no API data
+    if (!creditsConnected && uiOk) {
+      var pctEl = document.getElementById('cct-credits-pct');
+      if (pctEl && sessionMessages > 0) {
+        pctEl.textContent = sessionMessages + ' messages this session';
+      }
+    }
+
+    // Update reset countdown
+    if (creditsData && creditsData.resetAt) {
+      updateResetTimer(creditsData.resetAt);
+    }
+
+    // Check for rate limit indicators in the DOM
+    detectRateLimitDOM();
   } catch (e) {}
 }
 
@@ -365,7 +600,56 @@ function start() {
       deb = setTimeout(tick, 400);
     }).observe(target, { childList: true, subtree: true });
 
-    console.log('[CCT] v2.0 running');
+    // ── Credits: chrome.runtime integration ──
+    try {
+      // Listen for usage updates from background
+      if (chrome.runtime && chrome.runtime.onMessage) {
+        chrome.runtime.onMessage.addListener(function (msg) {
+          if (msg.type === 'CCT_USAGE_UPDATE') {
+            refreshCredits(msg.data);
+          }
+        });
+      }
+
+      // Listen for storage changes (backup channel)
+      if (chrome.storage && chrome.storage.onChanged) {
+        chrome.storage.onChanged.addListener(function (changes) {
+          if (changes.cctUsageData && changes.cctUsageData.newValue) {
+            refreshCredits(changes.cctUsageData.newValue);
+          }
+        });
+      }
+
+      // Request initial usage data
+      if (chrome.runtime && chrome.runtime.sendMessage) {
+        chrome.runtime.sendMessage({ type: 'CCT_GET_USAGE' }, function (resp) {
+          if (chrome.runtime.lastError) return;
+          if (resp && resp.data) refreshCredits(resp.data);
+        });
+      }
+
+      // Report detected model
+      var model = detectModel();
+      if (model && chrome.runtime && chrome.runtime.sendMessage) {
+        chrome.runtime.sendMessage({ type: 'CCT_MODEL_INFO', model: model });
+      }
+    } catch (e) {
+      console.log('[CCT] chrome.runtime setup error:', e);
+    }
+
+    // Fallback: after 30s, show offline state if no credits data
+    setTimeout(function () {
+      if (!creditsConnected && uiOk) {
+        var dot = document.getElementById('cct-credits-dot');
+        if (dot) dot.className = 'cct-dot cct-dot-offline';
+        var pctEl = document.getElementById('cct-credits-pct');
+        if (pctEl && sessionMessages === 0) {
+          pctEl.textContent = 'No data yet';
+        }
+      }
+    }, 30000);
+
+    console.log('[CCT] v2.1 running');
   } catch (e) {
     console.error('[CCT] Init error:', e);
     setTimeout(start, 3000);
