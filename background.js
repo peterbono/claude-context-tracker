@@ -209,53 +209,60 @@ async function tryFetchUsage() {
 }
 
 function processApiResponse(data, endpoint) {
-  var changed = false;
+  // Only extract rate limit data from explicitly rate-limit-shaped responses
+  // Must have BOTH a limit number AND a remaining number to be valid
+  var limit = null;
+  var remaining = null;
+  var resetAt = null;
 
-  // Try various response shapes
-  var sources = [data, data.rate_limit, data.rateLimit, data.usage, data.billing];
+  // Check nested objects that look like rate limit data
+  var sources = [data, data.rate_limit, data.rateLimit, data.usage];
 
   for (var i = 0; i < sources.length; i++) {
     var src = sources[i];
     if (!src || typeof src !== 'object') continue;
 
-    if (src.remaining !== undefined) { usageData.messagesRemaining = src.remaining; changed = true; }
-    if (src.messages_remaining !== undefined) { usageData.messagesRemaining = src.messages_remaining; changed = true; }
-    if (src.messagesRemaining !== undefined) { usageData.messagesRemaining = src.messagesRemaining; changed = true; }
+    // Need explicit rate-limit-named fields (not generic "remaining" or "limit")
+    var foundLimit = src.messages_limit || src.messagesLimit || src.message_limit;
+    var foundRemaining = src.messages_remaining !== undefined ? src.messages_remaining
+      : (src.messagesRemaining !== undefined ? src.messagesRemaining : undefined);
 
-    if (src.limit !== undefined) { usageData.messagesLimit = src.limit; changed = true; }
-    if (src.messages_limit !== undefined) { usageData.messagesLimit = src.messages_limit; changed = true; }
-    if (src.messagesLimit !== undefined) { usageData.messagesLimit = src.messagesLimit; changed = true; }
-
-    if (src.tokens_remaining !== undefined) { usageData.tokensRemaining = src.tokens_remaining; changed = true; }
-    if (src.tokens_limit !== undefined) { usageData.tokensLimit = src.tokens_limit; changed = true; }
-
-    if (src.reset || src.resetAt || src.reset_at || src.reset_time) {
-      usageData.resetAt = src.reset || src.resetAt || src.reset_at || src.reset_time;
-      changed = true;
-    }
-
-    if (src.plan || src.plan_type || src.planType) {
-      usageData.planType = src.plan || src.plan_type || src.planType;
+    if (foundLimit && foundRemaining !== undefined) {
+      limit = parseInt(foundLimit);
+      remaining = parseInt(foundRemaining);
+      break;
     }
   }
 
-  if (changed) {
-    if (usageData.messagesLimit && usageData.messagesRemaining !== null) {
-      usageData.percentUsed = Math.round(
-        ((usageData.messagesLimit - usageData.messagesRemaining) / usageData.messagesLimit) * 100
-      );
-      usageData.percentRemaining = 100 - usageData.percentUsed;
+  // Also check for reset times
+  for (var j = 0; j < sources.length; j++) {
+    var s = sources[j];
+    if (!s || typeof s !== 'object') continue;
+    if (s.resetAt || s.reset_at || s.reset_time) {
+      resetAt = s.resetAt || s.reset_at || s.reset_time;
+      break;
     }
+  }
+
+  // Only update if we found valid data (both limit AND remaining)
+  if (limit > 0 && remaining !== null && !isNaN(remaining)) {
+    usageData.messagesLimit = limit;
+    usageData.messagesRemaining = remaining;
+    usageData.percentUsed = Math.round(((limit - remaining) / limit) * 100);
+    usageData.percentRemaining = 100 - usageData.percentUsed;
+    if (resetAt) usageData.resetAt = resetAt;
     usageData.type = 'api';
     usageData.lastUpdated = Date.now();
+
+    chrome.storage.local.set({ cctUsageData: usageData });
+    pushUpdate();
   }
 
+  // Always store raw for debugging
   chrome.storage.local.set({
-    cctUsageData: usageData,
-    cctRawApi: JSON.stringify(data).substring(0, 2000)
+    cctRawApi: JSON.stringify(data).substring(0, 2000),
+    cctRawEndpoint: endpoint
   });
-
-  pushUpdate();
 }
 
 // ═══════════════════════════════════════════════════════════════

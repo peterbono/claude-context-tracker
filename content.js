@@ -193,26 +193,36 @@ function refreshCredits(data) {
 
   if (!dot || !pctEl || !resetEl || !barFill) return;
 
-  // No API data yet
-  if (!data || data.percentUsed === null) {
-    if (!creditsConnected) {
-      pctEl.textContent = sessionMessages > 0
-        ? sessionMessages + ' messages this session'
-        : 'Connecting...';
-      dot.className = 'cct-dot cct-dot-pending';
-      barFill.style.width = '0%';
-      resetEl.textContent = '';
-    }
+  // Only trust data if we have REAL limit+remaining numbers from the API
+  var hasRealData = data && data.type === 'api'
+    && data.messagesLimit !== null && data.messagesLimit > 0
+    && data.messagesRemaining !== null;
+
+  // Rate limited from DOM detection (user hit the wall)
+  var isRateLimited = data && data.type === 'dom'
+    && data.percentUsed === 100;
+
+  if (!hasRealData && !isRateLimited) {
+    // No reliable data — show session counter
+    pctEl.textContent = sessionMessages > 0
+      ? sessionMessages + ' messages this session'
+      : 'Connecting...';
+    dot.className = creditsConnected ? 'cct-dot cct-dot-live' : 'cct-dot cct-dot-pending';
+    barFill.style.width = '0%';
+    resetEl.textContent = '';
     return;
   }
 
   creditsConnected = true;
   dot.className = 'cct-dot cct-dot-live';
 
-  var remaining = data.percentRemaining !== null
-    ? data.percentRemaining
-    : (100 - Math.min(100, Math.max(0, data.percentUsed)));
-  remaining = Math.min(100, Math.max(0, remaining));
+  var remaining;
+  if (isRateLimited) {
+    remaining = 0;
+  } else {
+    remaining = Math.round((data.messagesRemaining / data.messagesLimit) * 100);
+    remaining = Math.min(100, Math.max(0, remaining));
+  }
 
   var c = getCreditsColor(remaining);
 
@@ -227,10 +237,10 @@ function refreshCredits(data) {
   barFill.style.background = c;
 
   // Update text
-  if (data.messagesRemaining !== null && data.messagesLimit !== null) {
+  if (hasRealData) {
     pctEl.textContent = data.messagesRemaining + '/' + data.messagesLimit + ' remaining';
   } else {
-    pctEl.textContent = remaining + '% remaining';
+    pctEl.textContent = 'Limit reached';
   }
   pctEl.style.color = c;
 
@@ -272,29 +282,62 @@ function updateResetTimer(isoDate) {
 
 function detectRateLimitDOM() {
   try {
-    var main = document.querySelector('main') || document.body;
-    var text = (main.innerText || '').toLowerCase();
-
-    if (text.includes('message limit') || text.includes('usage limit') ||
-        text.includes('try again in') || text.includes('rate limit') ||
-        text.includes('too many messages')) {
-      var match = text.match(/try again in (\d+)\s*(hour|minute|min|h|m)/i);
-      var secs = null;
-      if (match) {
-        var val = parseInt(match[1]);
-        var unit = match[2].toLowerCase();
-        secs = unit.startsWith('h') ? val * 3600 : val * 60;
+    // Only check specific UI elements — NOT conversation text
+    // Claude shows rate limit banners/dialogs outside the conversation flow
+    var selectors = [
+      '[role="alert"]',
+      '[role="dialog"]',
+      '[class*="RateLimit"]',
+      '[class*="rate-limit"]',
+      '[class*="UsageLimit"]',
+      '[class*="usage-limit"]',
+      '[data-testid*="limit"]',
+      '[data-testid*="rate"]'
+    ];
+    var found = false;
+    var text = '';
+    for (var i = 0; i < selectors.length; i++) {
+      var els = document.querySelectorAll(selectors[i]);
+      for (var j = 0; j < els.length; j++) {
+        var t = (els[j].innerText || '').toLowerCase();
+        if (t.includes('message limit') || t.includes('usage limit') ||
+            t.includes('try again') || t.includes('too many messages')) {
+          found = true;
+          text = t;
+          break;
+        }
       }
-
-      try {
-        chrome.runtime.sendMessage({
-          type: 'CCT_RATE_LIMITED',
-          resetSeconds: secs
-        });
-      } catch (e) {}
-
-      return { rateLimited: true, resetSeconds: secs };
+      if (found) break;
     }
+
+    // Also check for the input being disabled with a rate limit message
+    var input = document.querySelector('[data-testid="chat-input-ssr"]');
+    if (input && input.disabled) {
+      var placeholder = input.getAttribute('placeholder') || '';
+      if (placeholder.toLowerCase().includes('limit') || placeholder.toLowerCase().includes('try again')) {
+        found = true;
+        text = placeholder.toLowerCase();
+      }
+    }
+
+    if (!found) return null;
+
+    var match = text.match(/try again in (\d+)\s*(hour|minute|min|h|m)/i);
+    var secs = null;
+    if (match) {
+      var val = parseInt(match[1]);
+      var unit = match[2].toLowerCase();
+      secs = unit.startsWith('h') ? val * 3600 : val * 60;
+    }
+
+    try {
+      chrome.runtime.sendMessage({
+        type: 'CCT_RATE_LIMITED',
+        resetSeconds: secs
+      });
+    } catch (e) {}
+
+    return { rateLimited: true, resetSeconds: secs };
   } catch (e) {}
   return null;
 }
