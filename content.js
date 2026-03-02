@@ -23,6 +23,10 @@ var creditsConnected = false;
 var sessionMessages = 0;
 var lastMsgCount = 0;
 
+// ── Rate Limits from Settings Page ──
+var rateLimitsData = null;
+var settingsScrapeInterval = null;
+
 // ═══════════════════════════════════════════════════════════════
 // TOKEN ESTIMATION - using actual claude.ai data-testid selectors
 // ═══════════════════════════════════════════════════════════════
@@ -153,6 +157,14 @@ function getColor(p) {
   return '#A8403A';
 }
 
+function getUsageColor(usedPct) {
+  if (usedPct < 30) return '#8B9A6B';
+  if (usedPct < 60) return '#B8976A';
+  if (usedPct < 80) return '#C17A4A';
+  if (usedPct < 95) return '#C15F3C';
+  return '#A8403A';
+}
+
 function toast(msg) {
   var old = document.getElementById('cct-toast');
   if (old) old.remove();
@@ -161,6 +173,169 @@ function toast(msg) {
   document.body.appendChild(el);
   setTimeout(function () { el.style.opacity = '0'; }, 2000);
   setTimeout(function () { if (el.parentNode) el.remove(); }, 2500);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SETTINGS PAGE SCRAPING
+// Detects when user visits /settings and extracts usage data
+// ═══════════════════════════════════════════════════════════════
+function isSettingsPage() {
+  return location.pathname.includes('/settings');
+}
+
+function scrapeSettingsUsage() {
+  if (!isSettingsPage()) return null;
+
+  try {
+    var result = {
+      session: null,
+      weeklyAll: null,
+      weeklySonnet: null
+    };
+
+    // Strategy 1: Find progress bars and nearby text
+    // Look for all progress bar-like elements (divs with role="progressbar" or styled width)
+    var progressBars = document.querySelectorAll('[role="progressbar"], progress');
+
+    // Strategy 2: Find percentage text patterns like "X % utilisés" or "X% used"
+    var allText = document.body.innerText || '';
+
+    // Match patterns: "N % utilisés" or "N% used" or "N % used"
+    var pctMatches = allText.match(/(\d+)\s*%\s*(utilis[ée]s?|used)/gi);
+
+    if (pctMatches && pctMatches.length > 0) {
+      console.log('[CCT] Found percentage matches:', pctMatches);
+
+      // Parse each match
+      var percentages = [];
+      for (var i = 0; i < pctMatches.length; i++) {
+        var num = parseInt(pctMatches[i].match(/(\d+)/)[1]);
+        percentages.push(num);
+      }
+
+      // Match reset time patterns
+      // FR: "Réinitialisation dans X h Y min" or "Réinitialisation sam. 21:00"
+      // EN: "Resets in X h Y min" or "Resets Sat 21:00"
+      var resetMatches = allText.match(/(R[ée]initialisation|Resets?)\s+(dans\s+|in\s+)?([^\n]+)/gi) || [];
+      var resetTexts = [];
+      for (var r = 0; r < resetMatches.length; r++) {
+        var resetLine = resetMatches[r].trim();
+        // Extract the time part after "Réinitialisation" or "Resets"
+        var timePart = resetLine.replace(/^(R[ée]initialisation|Resets?)\s+(dans\s+|in\s+)?/i, '').trim();
+        resetTexts.push(timePart);
+      }
+
+      console.log('[CCT] Percentages:', percentages, 'Resets:', resetTexts);
+
+      // Map to our structure:
+      // First percentage = Session (if 3 found), or skip session
+      // The page shows: Session, then Weekly All Models, then Weekly Sonnet
+      if (percentages.length >= 3) {
+        result.session = { percentUsed: percentages[0], resetText: resetTexts[0] || '' };
+        result.weeklyAll = { percentUsed: percentages[1], resetText: resetTexts[1] || '' };
+        result.weeklySonnet = { percentUsed: percentages[2], resetText: resetTexts[2] || '' };
+      } else if (percentages.length === 2) {
+        // Might be just weekly limits
+        result.weeklyAll = { percentUsed: percentages[0], resetText: resetTexts[0] || '' };
+        result.weeklySonnet = { percentUsed: percentages[1], resetText: resetTexts[1] || '' };
+      } else if (percentages.length === 1) {
+        result.session = { percentUsed: percentages[0], resetText: resetTexts[0] || '' };
+      }
+    }
+
+    // Strategy 3: structural DOM scraping
+    // Look for sections with heading-like text and progress indicators
+    if (!result.session && !result.weeklyAll) {
+      result = scrapeSettingsStructural();
+    }
+
+    // Only send if we found something
+    if (result.session || result.weeklyAll || result.weeklySonnet) {
+      console.log('[CCT] Scraped settings data:', result);
+      return result;
+    }
+  } catch (e) {
+    console.log('[CCT] Settings scrape error:', e);
+  }
+
+  return null;
+}
+
+function scrapeSettingsStructural() {
+  var result = { session: null, weeklyAll: null, weeklySonnet: null };
+
+  try {
+    // Find all elements that could be section containers
+    // Look for text nodes that contain key phrases
+    var walker = document.createTreeWalker(
+      document.body,
+      NodeFilter.SHOW_ELEMENT,
+      null,
+      false
+    );
+
+    var sections = [];
+    var node;
+    while (node = walker.nextNode()) {
+      var text = (node.textContent || '').trim();
+      var directText = '';
+      // Get only direct text content (not children)
+      for (var c = 0; c < node.childNodes.length; c++) {
+        if (node.childNodes[c].nodeType === 3) {
+          directText += node.childNodes[c].textContent;
+        }
+      }
+      directText = directText.trim();
+
+      // Look for section labels
+      if (directText.match(/session\s+en\s+cours|current\s+session/i)) {
+        sections.push({ type: 'session', el: node });
+      } else if (directText.match(/tous\s+les\s+mod[èe]les|all\s+models/i)) {
+        sections.push({ type: 'weeklyAll', el: node });
+      } else if (directText.match(/sonnet\s+seulement|sonnet\s+only/i)) {
+        sections.push({ type: 'weeklySonnet', el: node });
+      }
+    }
+
+    // For each found section, look nearby for percentage and reset text
+    for (var s = 0; s < sections.length; s++) {
+      var sec = sections[s];
+      var container = sec.el.parentElement;
+
+      // Walk up to find a reasonable container
+      for (var up = 0; up < 5 && container; up++) {
+        var containerText = container.textContent || '';
+        var pctMatch = containerText.match(/(\d+)\s*%/);
+        var resetMatch = containerText.match(/(R[ée]initialisation|Resets?)\s+(dans\s+|in\s+)?([^\n,]+)/i);
+
+        if (pctMatch) {
+          result[sec.type] = {
+            percentUsed: parseInt(pctMatch[1]),
+            resetText: resetMatch ? resetMatch[3].trim() : ''
+          };
+          break;
+        }
+        container = container.parentElement;
+      }
+    }
+  } catch (e) {
+    console.log('[CCT] Structural scrape error:', e);
+  }
+
+  return result;
+}
+
+function sendSettingsData(data) {
+  try {
+    if (chrome.runtime && chrome.runtime.sendMessage) {
+      chrome.runtime.sendMessage({
+        type: 'CCT_SETTINGS_DATA',
+        data: data
+      });
+    }
+  } catch (e) {
+    console.log('[CCT] Send settings data error:', e);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -193,17 +368,14 @@ function refreshCredits(data) {
 
   if (!dot || !pctEl || !resetEl || !barFill) return;
 
-  // Only trust data if we have REAL limit+remaining numbers from the API
   var hasRealData = data && data.type === 'api'
     && data.messagesLimit !== null && data.messagesLimit > 0
     && data.messagesRemaining !== null;
 
-  // Rate limited from DOM detection (user hit the wall)
   var isRateLimited = data && data.type === 'dom'
     && data.percentUsed === 100;
 
   if (!hasRealData && !isRateLimited) {
-    // No API data — show live session counter (always useful)
     updateSessionDisplay();
     return;
   }
@@ -221,17 +393,14 @@ function refreshCredits(data) {
 
   var c = getCreditsColor(remaining);
 
-  // Check for recharge (remaining jumps from low to high)
   if (creditsPrevRemaining !== null && creditsPrevRemaining < 30 && remaining > 70) {
     celebrateRecharge();
   }
   creditsPrevRemaining = remaining;
 
-  // Animate the bar (shows remaining credits)
   barFill.style.width = remaining + '%';
   barFill.style.background = c;
 
-  // Update text
   if (hasRealData) {
     pctEl.textContent = data.messagesRemaining + '/' + data.messagesLimit + ' remaining';
   } else {
@@ -239,7 +408,6 @@ function refreshCredits(data) {
   }
   pctEl.style.color = c;
 
-  // Reset timer
   if (data.resetAt) {
     updateResetTimer(data.resetAt);
   } else if (data.resetSeconds && data.lastUpdated) {
@@ -295,10 +463,64 @@ function updateSessionDisplay() {
   resetEl.textContent = '';
 }
 
+// ═══════════════════════════════════════════════════════════════
+// RATE LIMITS DISPLAY (from settings page scraping)
+// ═══════════════════════════════════════════════════════════════
+function refreshRateLimits(data) {
+  if (!uiOk || !data) return;
+  rateLimitsData = data;
+
+  var container = document.getElementById('cct-limits');
+  if (!container) return;
+
+  // Check if we have any data
+  var hasData = data.session || data.weeklyAll || data.weeklySonnet;
+  if (!hasData) {
+    container.style.display = 'none';
+    return;
+  }
+
+  container.style.display = 'block';
+
+  // Update each row
+  updateLimitRow('session', data.session);
+  updateLimitRow('weekly', data.weeklyAll);
+  updateLimitRow('sonnet', data.weeklySonnet);
+}
+
+function updateLimitRow(id, limitData) {
+  var row = document.getElementById('cct-limit-' + id);
+  if (!row) return;
+
+  if (!limitData) {
+    row.style.display = 'none';
+    return;
+  }
+
+  row.style.display = 'flex';
+
+  var barFill = row.querySelector('.cct-limit-bar-fill');
+  var pctEl = row.querySelector('.cct-limit-pct');
+  var resetEl = row.querySelector('.cct-limit-reset');
+
+  if (barFill) {
+    var usedPct = limitData.percentUsed || 0;
+    barFill.style.width = usedPct + '%';
+    barFill.style.background = getUsageColor(usedPct);
+  }
+
+  if (pctEl) {
+    pctEl.textContent = (limitData.percentUsed || 0) + '%';
+    pctEl.style.color = getUsageColor(limitData.percentUsed || 0);
+  }
+
+  if (resetEl) {
+    resetEl.textContent = limitData.resetText || '';
+  }
+}
+
 function detectRateLimitDOM() {
   try {
-    // Only check specific UI elements — NOT conversation text
-    // Claude shows rate limit banners/dialogs outside the conversation flow
     var selectors = [
       '[role="alert"]',
       '[role="dialog"]',
@@ -325,7 +547,6 @@ function detectRateLimitDOM() {
       if (found) break;
     }
 
-    // Also check for the input being disabled with a rate limit message
     var input = document.querySelector('[data-testid="chat-input-ssr"]');
     if (input && input.disabled) {
       var placeholder = input.getAttribute('placeholder') || '';
@@ -366,19 +587,15 @@ function celebrateRecharge() {
   var credits = document.getElementById('cct-credits');
   if (!credits) return;
 
-  // Glow effect on section
   credits.classList.add('cct-celebrating');
 
-  // Show "Recharged" label
   var recharged = document.getElementById('cct-recharged');
   if (recharged) recharged.classList.add('show');
 
-  // Sparkle particles
   for (var i = 0; i < 8; i++) {
     createSparkle(credits, i);
   }
 
-  // Clean up after animation
   setTimeout(function () {
     credits.classList.remove('cct-celebrating');
     if (recharged) recharged.classList.remove('show');
@@ -391,28 +608,23 @@ function createSparkle(parent, index) {
   var el = document.createElement('div');
   el.className = 'cct-sparkle';
 
-  // Random upward direction with spread
   var angle = -Math.PI / 2 + (Math.random() - 0.5) * Math.PI * 0.8;
   var distance = 25 + Math.random() * 35;
   var endX = Math.cos(angle) * distance;
   var endY = Math.sin(angle) * distance;
 
-  // Palette colors
   var colors = ['#D4A574', '#C15F3C', '#8B9A6B', '#B8976A', '#E8C5A0', '#A8403A'];
   el.style.background = colors[index % colors.length];
 
-  // Random position along section width
   el.style.left = (Math.random() * 100) + '%';
   el.style.top = '50%';
   el.style.setProperty('--sparkle-x', endX + 'px');
   el.style.setProperty('--sparkle-y', endY + 'px');
 
-  // Size variation
   var size = 3 + Math.random() * 4;
   el.style.width = size + 'px';
   el.style.height = size + 'px';
 
-  // Stagger timing
   el.style.animationDelay = (index * 0.07) + 's';
 
   parent.appendChild(el);
@@ -444,6 +656,8 @@ function buildUI() {
         '<div id="cct-pct" style="color:#8B9A6B">0%</div>' +
         '<div id="cct-sub">Estimating...</div>' +
         '<div id="cct-bar-bg"><div id="cct-bar-fill" style="width:0%;background:#8B9A6B"></div></div>' +
+
+        // Usage section (API rate limits)
         '<div id="cct-credits">' +
           '<div id="cct-credits-head">' +
             '<span class="cct-section-label">Usage</span>' +
@@ -456,6 +670,39 @@ function buildUI() {
           '</div>' +
           '<div id="cct-recharged">Recharged \u2726</div>' +
         '</div>' +
+
+        // Rate Limits section (from settings page)
+        '<div id="cct-limits" style="display:none">' +
+          '<div id="cct-limits-head">' +
+            '<span class="cct-section-label">Limits</span>' +
+            '<span id="cct-limits-dot" class="cct-dot cct-dot-live"></span>' +
+          '</div>' +
+
+          // Session row
+          '<div id="cct-limit-session" class="cct-limit-row" style="display:none">' +
+            '<span class="cct-limit-label">Session</span>' +
+            '<div class="cct-limit-bar-bg"><div class="cct-limit-bar-fill"></div></div>' +
+            '<span class="cct-limit-pct">0%</span>' +
+            '<span class="cct-limit-reset"></span>' +
+          '</div>' +
+
+          // Weekly All row
+          '<div id="cct-limit-weekly" class="cct-limit-row" style="display:none">' +
+            '<span class="cct-limit-label">Weekly</span>' +
+            '<div class="cct-limit-bar-bg"><div class="cct-limit-bar-fill"></div></div>' +
+            '<span class="cct-limit-pct">0%</span>' +
+            '<span class="cct-limit-reset"></span>' +
+          '</div>' +
+
+          // Sonnet row
+          '<div id="cct-limit-sonnet" class="cct-limit-row" style="display:none">' +
+            '<span class="cct-limit-label">Sonnet</span>' +
+            '<div class="cct-limit-bar-bg"><div class="cct-limit-bar-fill"></div></div>' +
+            '<span class="cct-limit-pct">0%</span>' +
+            '<span class="cct-limit-reset"></span>' +
+          '</div>' +
+        '</div>' +
+
         '<div id="cct-extra">' +
           '<div><span>Tokens (est.)</span><span id="cct-tok">0</span></div>' +
           '<div><span>Messages</span><span id="cct-msg">0</span></div>' +
@@ -611,7 +858,7 @@ function tick() {
     pct = (d.tokens / MAX_TOKENS) * 100;
     msgCount = d.count;
 
-    // Track session messages (count new user messages)
+    // Track session messages
     if (d.count > lastMsgCount && lastMsgCount > 0) {
       sessionMessages += (d.count - lastMsgCount);
     }
@@ -624,6 +871,21 @@ function tick() {
       refreshCredits(creditsData);
     } else {
       updateSessionDisplay();
+    }
+
+    // Update rate limits section (from settings page data)
+    if (rateLimitsData) {
+      refreshRateLimits(rateLimitsData);
+    }
+
+    // If we're on the settings page, try to scrape usage data
+    if (isSettingsPage()) {
+      var scraped = scrapeSettingsUsage();
+      if (scraped) {
+        rateLimitsData = scraped;
+        refreshRateLimits(scraped);
+        sendSettingsData(scraped);
+      }
     }
 
     // Check for rate limit indicators in the DOM
@@ -652,13 +914,17 @@ function start() {
       deb = setTimeout(tick, 400);
     }).observe(target, { childList: true, subtree: true });
 
-    // ── Credits: chrome.runtime integration ──
+    // ── Chrome runtime integration ──
     try {
       // Listen for usage updates from background
       if (chrome.runtime && chrome.runtime.onMessage) {
         chrome.runtime.onMessage.addListener(function (msg) {
           if (msg.type === 'CCT_USAGE_UPDATE') {
             refreshCredits(msg.data);
+            if (msg.rateLimits) {
+              rateLimitsData = msg.rateLimits;
+              refreshRateLimits(msg.rateLimits);
+            }
           }
         });
       }
@@ -669,14 +935,22 @@ function start() {
           if (changes.cctUsageData && changes.cctUsageData.newValue) {
             refreshCredits(changes.cctUsageData.newValue);
           }
+          if (changes.cctRateLimits && changes.cctRateLimits.newValue) {
+            rateLimitsData = changes.cctRateLimits.newValue;
+            refreshRateLimits(changes.cctRateLimits.newValue);
+          }
         });
       }
 
-      // Request initial usage data
+      // Request initial data
       if (chrome.runtime && chrome.runtime.sendMessage) {
         chrome.runtime.sendMessage({ type: 'CCT_GET_USAGE' }, function (resp) {
           if (chrome.runtime.lastError) return;
           if (resp && resp.data) refreshCredits(resp.data);
+          if (resp && resp.rateLimits) {
+            rateLimitsData = resp.rateLimits;
+            refreshRateLimits(resp.rateLimits);
+          }
         });
       }
 
@@ -689,7 +963,33 @@ function start() {
       console.log('[CCT] chrome.runtime setup error:', e);
     }
 
-    console.log('[CCT] v2.2 running');
+    // If on settings page, scrape immediately and then periodically
+    if (isSettingsPage()) {
+      setTimeout(function() {
+        var scraped = scrapeSettingsUsage();
+        if (scraped) {
+          rateLimitsData = scraped;
+          refreshRateLimits(scraped);
+          sendSettingsData(scraped);
+        }
+      }, 2000);
+
+      // Re-scrape every 30s while on settings page
+      settingsScrapeInterval = setInterval(function() {
+        if (!isSettingsPage()) {
+          clearInterval(settingsScrapeInterval);
+          return;
+        }
+        var scraped = scrapeSettingsUsage();
+        if (scraped) {
+          rateLimitsData = scraped;
+          refreshRateLimits(scraped);
+          sendSettingsData(scraped);
+        }
+      }, 30000);
+    }
+
+    console.log('[CCT] v2.3 running');
   } catch (e) {
     console.error('[CCT] Init error:', e);
     setTimeout(start, 3000);

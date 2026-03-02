@@ -19,17 +19,30 @@ var usageData = {
   planType: null,
   lastUpdated: null
 };
+
+// Rate limits scraped from settings page (session + weekly)
+var rateLimits = {
+  session: null,      // { percentUsed: N, resetText: "4h 51min" }
+  weeklyAll: null,    // { percentUsed: N, resetText: "sam. 21:00" }
+  weeklySonnet: null, // { percentUsed: N, resetText: "sam. 21:00" }
+  lastUpdated: null
+};
+
 var headerCache = {};
 var discoveryDone = false;
+var discoveredEndpoints = [];
 
 // ═══════════════════════════════════════════════════════════════
-// WebRequest: Capture org_id + rate limit headers
+// WebRequest: Capture org_id + rate limit headers + discover endpoints
 // ═══════════════════════════════════════════════════════════════
 
 chrome.webRequest.onBeforeRequest.addListener(
   function(details) {
+    var url = details.url;
+
+    // Discover org_id
     if (!orgId) {
-      var m = details.url.match(/\/api\/organizations\/([a-f0-9-]+)/);
+      var m = url.match(/\/api\/organizations\/([a-f0-9-]+)/);
       if (m) {
         orgId = m[1];
         console.log('[CCT-BG] org_id:', orgId);
@@ -38,6 +51,15 @@ chrome.webRequest.onBeforeRequest.addListener(
           discoveryDone = true;
           tryFetchUsage();
         }
+      }
+    }
+
+    // Log potential usage/rate-limit API calls for later re-use
+    if (url.includes('rate_limit') || url.includes('usage') || url.includes('limits')) {
+      if (discoveredEndpoints.indexOf(url) === -1) {
+        discoveredEndpoints.push(url);
+        console.log('[CCT-BG] Discovered endpoint:', url);
+        chrome.storage.local.set({ cctDiscoveredEndpoints: discoveredEndpoints });
       }
     }
   },
@@ -140,7 +162,6 @@ async function discoverOrgId() {
       var data = await resp.json();
       console.log('[CCT-BG] Session data keys:', Object.keys(data));
 
-      // Try common structures
       if (data.account && data.account.memberships) {
         for (var i = 0; i < data.account.memberships.length; i++) {
           var membership = data.account.memberships[i];
@@ -154,12 +175,10 @@ async function discoverOrgId() {
         }
       }
 
-      // Alternative structures
       if (data.uuid) { orgId = data.uuid; return true; }
       if (data.organization_id) { orgId = data.organization_id; return true; }
       if (data.org_id) { orgId = data.org_id; return true; }
 
-      // Store raw for debugging
       chrome.storage.local.set({ cctSessionRaw: JSON.stringify(data).substring(0, 3000) });
     }
   } catch (e) {
@@ -180,12 +199,22 @@ async function tryFetchUsage() {
   console.log('[CCT-BG] Fetching usage for org:', orgId);
 
   var endpoints = [
+    '/api/organizations/' + orgId + '/rate_limits',
     '/api/organizations/' + orgId + '/rate_limiter/usage',
     '/api/organizations/' + orgId + '/usage',
+    '/api/organizations/' + orgId + '/chat/rate_limits',
     '/api/organizations/' + orgId + '/stats',
     '/api/organizations/' + orgId + '/settings/billing',
     '/api/organizations/' + orgId + '/settings',
   ];
+
+  // Also try any previously discovered endpoints
+  for (var d = 0; d < discoveredEndpoints.length; d++) {
+    var ep = discoveredEndpoints[d].replace('https://claude.ai', '');
+    if (endpoints.indexOf(ep) === -1) {
+      endpoints.unshift(ep);
+    }
+  }
 
   for (var i = 0; i < endpoints.length; i++) {
     try {
@@ -205,24 +234,20 @@ async function tryFetchUsage() {
     }
   }
 
-  console.log('[CCT-BG] No usage endpoint found');
+  console.log('[CCT-BG] No usage endpoint found via API');
 }
 
 function processApiResponse(data, endpoint) {
-  // Only extract rate limit data from explicitly rate-limit-shaped responses
-  // Must have BOTH a limit number AND a remaining number to be valid
   var limit = null;
   var remaining = null;
   var resetAt = null;
 
-  // Check nested objects that look like rate limit data
-  var sources = [data, data.rate_limit, data.rateLimit, data.usage];
+  var sources = [data, data.rate_limit, data.rateLimit, data.usage, data.rate_limits];
 
   for (var i = 0; i < sources.length; i++) {
     var src = sources[i];
     if (!src || typeof src !== 'object') continue;
 
-    // Need explicit rate-limit-named fields (not generic "remaining" or "limit")
     var foundLimit = src.messages_limit || src.messagesLimit || src.message_limit;
     var foundRemaining = src.messages_remaining !== undefined ? src.messages_remaining
       : (src.messagesRemaining !== undefined ? src.messagesRemaining : undefined);
@@ -234,7 +259,6 @@ function processApiResponse(data, endpoint) {
     }
   }
 
-  // Also check for reset times
   for (var j = 0; j < sources.length; j++) {
     var s = sources[j];
     if (!s || typeof s !== 'object') continue;
@@ -244,7 +268,6 @@ function processApiResponse(data, endpoint) {
     }
   }
 
-  // Only update if we found valid data (both limit AND remaining)
   if (limit > 0 && remaining !== null && !isNaN(remaining)) {
     usageData.messagesLimit = limit;
     usageData.messagesRemaining = remaining;
@@ -258,7 +281,6 @@ function processApiResponse(data, endpoint) {
     pushUpdate();
   }
 
-  // Always store raw for debugging
   chrome.storage.local.set({
     cctRawApi: JSON.stringify(data).substring(0, 2000),
     cctRawEndpoint: endpoint
@@ -270,13 +292,14 @@ function processApiResponse(data, endpoint) {
 // ═══════════════════════════════════════════════════════════════
 
 function pushUpdate() {
-  chrome.storage.local.set({ cctUsageData: usageData });
+  chrome.storage.local.set({ cctUsageData: usageData, cctRateLimits: rateLimits });
 
   chrome.tabs.query({ url: "https://claude.ai/*" }, function(tabs) {
     for (var i = 0; i < tabs.length; i++) {
       chrome.tabs.sendMessage(tabs[i].id, {
         type: 'CCT_USAGE_UPDATE',
-        data: usageData
+        data: usageData,
+        rateLimits: rateLimits
       }).catch(function() {});
     }
   });
@@ -288,7 +311,7 @@ function pushUpdate() {
 
 chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
   if (msg.type === 'CCT_GET_USAGE') {
-    sendResponse({ data: usageData, headers: headerCache, orgId: orgId });
+    sendResponse({ data: usageData, headers: headerCache, orgId: orgId, rateLimits: rateLimits });
     return true;
   }
 
@@ -319,6 +342,19 @@ chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
     sendResponse({ ok: true });
     return true;
   }
+
+  // Content script scraped the settings page DOM
+  if (msg.type === 'CCT_SETTINGS_DATA') {
+    console.log('[CCT-BG] Received settings page data:', JSON.stringify(msg.data));
+    if (msg.data) {
+      rateLimits = msg.data;
+      rateLimits.lastUpdated = Date.now();
+      chrome.storage.local.set({ cctRateLimits: rateLimits });
+      pushUpdate();
+    }
+    sendResponse({ ok: true });
+    return true;
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════
@@ -335,7 +371,7 @@ chrome.alarms.onAlarm.addListener(function(alarm) {
 // On install
 chrome.runtime.onInstalled.addListener(function() {
   console.log('[CCT-BG] Installed/updated');
-  chrome.storage.local.set({ cctUsageData: usageData });
+  chrome.storage.local.set({ cctUsageData: usageData, cctRateLimits: rateLimits });
 });
 
 // Try to discover org on startup
