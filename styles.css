@@ -254,8 +254,8 @@
 .cct-limit-row {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-bottom: 6px;
+  gap: 6px;
+  margin-bottom: 7px;
   font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
   font-size: 11px;
 }
@@ -266,7 +266,7 @@
 .cct-limit-label {
   color: rgba(61, 57, 41, 0.45);
   font-weight: 500;
-  min-width: 46px;
+  min-width: 48px;
   flex-shrink: 0;
   font-size: 10px;
   text-transform: uppercase;
@@ -279,7 +279,7 @@
   background: rgba(61, 57, 41, 0.06);
   border-radius: 2px;
   overflow: hidden;
-  min-width: 40px;
+  min-width: 30px;
 }
 .cct-limit-bar-fill {
   height: 100%;
@@ -292,7 +292,7 @@
 .cct-limit-pct {
   font-weight: 600;
   font-size: 11px;
-  min-width: 28px;
+  min-width: 26px;
   text-align: right;
   transition: color .4s ease;
   color: rgba(61, 57, 41, 0.5);
@@ -301,11 +301,7 @@
 .cct-limit-reset {
   color: rgba(61, 57, 41, 0.3);
   font-size: 9px;
-  min-width: 0;
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  max-width: 60px;
 }
 
 /* ═══════════════════════════════════════════════════════════

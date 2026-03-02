@@ -178,9 +178,21 @@ function toast(msg) {
 // ═══════════════════════════════════════════════════════════════
 // SETTINGS PAGE SCRAPING
 // Detects when user visits /settings and extracts usage data
+// Uses structural DOM approach: find section labels first, then
+// extract percentage + reset text from their parent containers
 // ═══════════════════════════════════════════════════════════════
 function isSettingsPage() {
   return location.pathname.includes('/settings');
+}
+
+function getDirectText(el) {
+  var text = '';
+  for (var c = 0; c < el.childNodes.length; c++) {
+    if (el.childNodes[c].nodeType === 3) {
+      text += el.childNodes[c].textContent;
+    }
+  }
+  return text.trim();
 }
 
 function scrapeSettingsUsage() {
@@ -193,67 +205,72 @@ function scrapeSettingsUsage() {
       weeklySonnet: null
     };
 
-    // Strategy 1: Find progress bars and nearby text
-    // Look for all progress bar-like elements (divs with role="progressbar" or styled width)
-    var progressBars = document.querySelectorAll('[role="progressbar"], progress');
-
-    // Strategy 2: Find percentage text patterns like "X % utilisés" or "X% used"
-    var allText = document.body.innerText || '';
-
-    // Match patterns: "N % utilisés" or "N% used" or "N % used"
-    var pctMatches = allText.match(/(\d+)\s*%\s*(utilis[ée]s?|used)/gi);
-
-    if (pctMatches && pctMatches.length > 0) {
-      console.log('[CCT] Found percentage matches:', pctMatches);
-
-      // Parse each match
-      var percentages = [];
-      for (var i = 0; i < pctMatches.length; i++) {
-        var num = parseInt(pctMatches[i].match(/(\d+)/)[1]);
-        percentages.push(num);
-      }
-
-      // Match reset time patterns
-      // FR: "Réinitialisation dans X h Y min" or "Réinitialisation sam. 21:00"
-      // EN: "Resets in X h Y min" or "Resets Sat 21:00"
-      var resetMatches = allText.match(/(R[ée]initialisation|Resets?)\s+(dans\s+|in\s+)?([^\n]+)/gi) || [];
-      var resetTexts = [];
-      for (var r = 0; r < resetMatches.length; r++) {
-        var resetLine = resetMatches[r].trim();
-        // Extract the time part after "Réinitialisation" or "Resets"
-        var timePart = resetLine.replace(/^(R[ée]initialisation|Resets?)\s+(dans\s+|in\s+)?/i, '').trim();
-        resetTexts.push(timePart);
-      }
-
-      console.log('[CCT] Percentages:', percentages, 'Resets:', resetTexts);
-
-      // Map to our structure:
-      // First percentage = Session (if 3 found), or skip session
-      // The page shows: Session, then Weekly All Models, then Weekly Sonnet
-      if (percentages.length >= 3) {
-        result.session = { percentUsed: percentages[0], resetText: resetTexts[0] || '' };
-        result.weeklyAll = { percentUsed: percentages[1], resetText: resetTexts[1] || '' };
-        result.weeklySonnet = { percentUsed: percentages[2], resetText: resetTexts[2] || '' };
-      } else if (percentages.length === 2) {
-        // Might be just weekly limits
-        result.weeklyAll = { percentUsed: percentages[0], resetText: resetTexts[0] || '' };
-        result.weeklySonnet = { percentUsed: percentages[1], resetText: resetTexts[1] || '' };
-      } else if (percentages.length === 1) {
-        result.session = { percentUsed: percentages[0], resetText: resetTexts[0] || '' };
+    // Strategy 1: aria-based (progressbar elements)
+    var progressBars = document.querySelectorAll('[role="progressbar"]');
+    if (progressBars.length > 0) {
+      console.log('[CCT] Found', progressBars.length, 'progressbar elements');
+      for (var p = 0; p < progressBars.length; p++) {
+        var bar = progressBars[p];
+        var val = bar.getAttribute('aria-valuenow');
+        var max = bar.getAttribute('aria-valuemax');
+        console.log('[CCT] progressbar[' + p + '] valuenow=' + val + ' valuemax=' + max);
       }
     }
 
-    // Strategy 3: structural DOM scraping
-    // Look for sections with heading-like text and progress indicators
-    if (!result.session && !result.weeklyAll) {
-      result = scrapeSettingsStructural();
+    // Strategy 2: Structural - find section label elements, then extract data nearby
+    // Labels we look for (FR and EN)
+    var labelMap = [
+      { patterns: [/session\s+en\s+cours/i, /current\s+session/i], type: 'session' },
+      { patterns: [/tous\s+les\s+mod[èe]les/i, /all\s+models/i], type: 'weeklyAll' },
+      { patterns: [/sonnet\s+seulement/i, /sonnet\s+only/i], type: 'weeklySonnet' }
+    ];
+
+    // Walk the DOM tree looking for label elements
+    var allEls = document.body.querySelectorAll('*');
+    var foundLabels = [];
+
+    for (var i = 0; i < allEls.length; i++) {
+      var el = allEls[i];
+      var dt = getDirectText(el);
+      if (!dt || dt.length > 50) continue; // Labels are short text
+
+      for (var lm = 0; lm < labelMap.length; lm++) {
+        var entry = labelMap[lm];
+        for (var pp = 0; pp < entry.patterns.length; pp++) {
+          if (entry.patterns[pp].test(dt)) {
+            foundLabels.push({ type: entry.type, el: el, text: dt });
+            console.log('[CCT] Found label:', entry.type, '=', dt, 'tag:', el.tagName);
+            break;
+          }
+        }
+      }
     }
 
-    // Only send if we found something
+    // For each found label, find its section container and extract data
+    for (var f = 0; f < foundLabels.length; f++) {
+      var label = foundLabels[f];
+      var data = extractSectionData(label.el);
+      if (data) {
+        result[label.type] = data;
+        console.log('[CCT] Extracted', label.type, ':', JSON.stringify(data));
+      }
+    }
+
+    // Only return if we found at least something
     if (result.session || result.weeklyAll || result.weeklySonnet) {
-      console.log('[CCT] Scraped settings data:', result);
+      console.log('[CCT] Final scraped data:', JSON.stringify(result));
       return result;
     }
+
+    // Strategy 3: Fallback - look for percentage patterns near progress bars
+    // If no labels found, try to find progress elements and use their order
+    if (foundLabels.length === 0) {
+      console.log('[CCT] No labels found, trying fallback...');
+      var fallback = scrapeFallback();
+      if (fallback) return fallback;
+    }
+
+    console.log('[CCT] No usage data found on settings page');
   } catch (e) {
     console.log('[CCT] Settings scrape error:', e);
   }
@@ -261,68 +278,100 @@ function scrapeSettingsUsage() {
   return null;
 }
 
-function scrapeSettingsStructural() {
-  var result = { session: null, weeklyAll: null, weeklySonnet: null };
+function extractSectionData(labelEl) {
+  // From the label element, walk UP the DOM to find the section container
+  // The container should have: a percentage text AND optionally a reset time
+  // We walk up gradually, checking at each level if we find the data we need
+  // But we STOP walking up before we reach a container that includes OTHER sections
 
-  try {
-    // Find all elements that could be section containers
-    // Look for text nodes that contain key phrases
-    var walker = document.createTreeWalker(
-      document.body,
-      NodeFilter.SHOW_ELEMENT,
-      null,
-      false
-    );
+  var container = labelEl.parentElement;
+  var bestPct = null;
+  var bestReset = '';
 
-    var sections = [];
-    var node;
-    while (node = walker.nextNode()) {
-      var text = (node.textContent || '').trim();
-      var directText = '';
-      // Get only direct text content (not children)
-      for (var c = 0; c < node.childNodes.length; c++) {
-        if (node.childNodes[c].nodeType === 3) {
-          directText += node.childNodes[c].textContent;
-        }
-      }
-      directText = directText.trim();
+  for (var up = 0; up < 8 && container && container !== document.body; up++) {
+    var text = container.textContent || '';
 
-      // Look for section labels
-      if (directText.match(/session\s+en\s+cours|current\s+session/i)) {
-        sections.push({ type: 'session', el: node });
-      } else if (directText.match(/tous\s+les\s+mod[èe]les|all\s+models/i)) {
-        sections.push({ type: 'weeklyAll', el: node });
-      } else if (directText.match(/sonnet\s+seulement|sonnet\s+only/i)) {
-        sections.push({ type: 'weeklySonnet', el: node });
-      }
+    // Look for percentage: "N % utilisés" or "N% used" or just "N %" near a bar
+    var pctMatch = text.match(/(\d+)\s*%\s*(utilis[ée]s?|used)/i);
+    if (!pctMatch) {
+      // Also try standalone "N %" if near a progressbar
+      pctMatch = text.match(/(\d+)\s*%/);
     }
 
-    // For each found section, look nearby for percentage and reset text
-    for (var s = 0; s < sections.length; s++) {
-      var sec = sections[s];
-      var container = sec.el.parentElement;
+    // Look for reset time
+    var resetMatch = text.match(/(R[ée]initialisation|Resets?)\s+(dans\s+|in\s+)?(\d+\s*h\s*\d+\s*min|\d+\s*min|[a-zé]+\.?\s+\d{1,2}:\d{2})/i);
 
-      // Walk up to find a reasonable container
-      for (var up = 0; up < 5 && container; up++) {
-        var containerText = container.textContent || '';
-        var pctMatch = containerText.match(/(\d+)\s*%/);
-        var resetMatch = containerText.match(/(R[ée]initialisation|Resets?)\s+(dans\s+|in\s+)?([^\n,]+)/i);
-
-        if (pctMatch) {
-          result[sec.type] = {
-            percentUsed: parseInt(pctMatch[1]),
-            resetText: resetMatch ? resetMatch[3].trim() : ''
-          };
-          break;
-        }
-        container = container.parentElement;
+    if (pctMatch) {
+      bestPct = parseInt(pctMatch[1]);
+      if (resetMatch) {
+        bestReset = resetMatch[3].trim();
       }
+
+      // Check: does this container also include OTHER section labels?
+      // If yes, we've gone too far up
+      var containerText = text.toLowerCase();
+      var labelCount = 0;
+      if (containerText.match(/session\s+en\s+cours|current\s+session/i)) labelCount++;
+      if (containerText.match(/tous\s+les\s+mod[èe]les|all\s+models/i)) labelCount++;
+      if (containerText.match(/sonnet\s+seulement|sonnet\s+only/i)) labelCount++;
+
+      if (labelCount <= 1) {
+        // Good - this container belongs to just one section
+        return { percentUsed: bestPct, resetText: bestReset };
+      }
+      // else: too broad, keep walking but use the data from a previous level
     }
-  } catch (e) {
-    console.log('[CCT] Structural scrape error:', e);
+
+    container = container.parentElement;
   }
 
-  return result;
+  // If we found data but the container was always too broad, use the percentage
+  // from the closest valid match
+  if (bestPct !== null) {
+    return { percentUsed: bestPct, resetText: bestReset };
+  }
+
+  return null;
+}
+
+function scrapeFallback() {
+  // Fallback: find all elements containing "N % utilisés" or "N% used"
+  // and map them by their position on the page (top to bottom)
+  var result = { session: null, weeklyAll: null, weeklySonnet: null };
+
+  var allEls = document.body.querySelectorAll('*');
+  var pctElements = [];
+
+  for (var i = 0; i < allEls.length; i++) {
+    var dt = getDirectText(allEls[i]);
+    var match = dt.match(/^(\d+)\s*%\s*(utilis[ée]s?|used)?$/i);
+    if (match) {
+      var rect = allEls[i].getBoundingClientRect();
+      pctElements.push({
+        pct: parseInt(match[1]),
+        top: rect.top,
+        el: allEls[i]
+      });
+    }
+  }
+
+  // Sort by vertical position (top to bottom)
+  pctElements.sort(function(a, b) { return a.top - b.top; });
+
+  console.log('[CCT] Fallback found', pctElements.length, 'percentage elements:', pctElements.map(function(p) { return p.pct + '% @' + Math.round(p.top); }));
+
+  if (pctElements.length >= 3) {
+    result.session = { percentUsed: pctElements[0].pct, resetText: '' };
+    result.weeklyAll = { percentUsed: pctElements[1].pct, resetText: '' };
+    result.weeklySonnet = { percentUsed: pctElements[2].pct, resetText: '' };
+    return result;
+  } else if (pctElements.length === 2) {
+    result.weeklyAll = { percentUsed: pctElements[0].pct, resetText: '' };
+    result.weeklySonnet = { percentUsed: pctElements[1].pct, resetText: '' };
+    return result;
+  }
+
+  return null;
 }
 
 function sendSettingsData(data) {
