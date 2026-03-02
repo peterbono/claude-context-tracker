@@ -203,13 +203,8 @@ function refreshCredits(data) {
     && data.percentUsed === 100;
 
   if (!hasRealData && !isRateLimited) {
-    // No reliable data — show session counter
-    pctEl.textContent = sessionMessages > 0
-      ? sessionMessages + ' messages this session'
-      : 'Connecting...';
-    dot.className = creditsConnected ? 'cct-dot cct-dot-live' : 'cct-dot cct-dot-pending';
-    barFill.style.width = '0%';
-    resetEl.textContent = '';
+    // No API data — show live session counter (always useful)
+    updateSessionDisplay();
     return;
   }
 
@@ -278,6 +273,26 @@ function updateResetTimer(isoDate) {
   } else {
     resetEl.textContent = '\u21bb <1min';
   }
+}
+
+function updateSessionDisplay() {
+  var pctEl = document.getElementById('cct-credits-pct');
+  var resetEl = document.getElementById('cct-credits-reset');
+  var barFill = document.getElementById('cct-credits-bar-fill');
+  var dot = document.getElementById('cct-credits-dot');
+  if (!pctEl) return;
+
+  dot.className = 'cct-dot cct-dot-live';
+  barFill.style.width = '0%';
+
+  var model = detectModel();
+  var parts = [];
+  if (msgCount > 0) parts.push(msgCount + ' msgs');
+  if (model) parts.push(model);
+
+  pctEl.textContent = parts.length > 0 ? parts.join(' \u00b7 ') : '\u2014';
+  pctEl.style.color = 'rgba(61, 57, 41, 0.5)';
+  resetEl.textContent = '';
 }
 
 function detectRateLimitDOM() {
@@ -431,12 +446,12 @@ function buildUI() {
         '<div id="cct-bar-bg"><div id="cct-bar-fill" style="width:0%;background:#8B9A6B"></div></div>' +
         '<div id="cct-credits">' +
           '<div id="cct-credits-head">' +
-            '<span class="cct-section-label">Credits</span>' +
-            '<span id="cct-credits-dot" class="cct-dot cct-dot-pending"></span>' +
+            '<span class="cct-section-label">Usage</span>' +
+            '<span id="cct-credits-dot" class="cct-dot cct-dot-live"></span>' +
           '</div>' +
           '<div id="cct-credits-bar-bg"><div id="cct-credits-bar-fill"></div></div>' +
           '<div id="cct-credits-info">' +
-            '<span id="cct-credits-pct">Connecting...</span>' +
+            '<span id="cct-credits-pct">\u2014</span>' +
             '<span id="cct-credits-reset"></span>' +
           '</div>' +
           '<div id="cct-recharged">Recharged \u2726</div>' +
@@ -604,17 +619,11 @@ function tick() {
 
     refresh(d.tokens, pct, d.count);
 
-    // Update credits with session count when no API data
-    if (!creditsConnected && uiOk) {
-      var pctEl = document.getElementById('cct-credits-pct');
-      if (pctEl && sessionMessages > 0) {
-        pctEl.textContent = sessionMessages + ' messages this session';
-      }
-    }
-
-    // Update reset countdown
-    if (creditsData && creditsData.resetAt) {
-      updateResetTimer(creditsData.resetAt);
+    // Update credits/usage section
+    if (creditsConnected && creditsData) {
+      refreshCredits(creditsData);
+    } else {
+      updateSessionDisplay();
     }
 
     // Check for rate limit indicators in the DOM
@@ -680,19 +689,7 @@ function start() {
       console.log('[CCT] chrome.runtime setup error:', e);
     }
 
-    // Fallback: after 30s, show offline state if no credits data
-    setTimeout(function () {
-      if (!creditsConnected && uiOk) {
-        var dot = document.getElementById('cct-credits-dot');
-        if (dot) dot.className = 'cct-dot cct-dot-offline';
-        var pctEl = document.getElementById('cct-credits-pct');
-        if (pctEl && sessionMessages === 0) {
-          pctEl.textContent = 'No data yet';
-        }
-      }
-    }, 30000);
-
-    console.log('[CCT] v2.1 running');
+    console.log('[CCT] v2.2 running');
   } catch (e) {
     console.error('[CCT] Init error:', e);
     setTimeout(start, 3000);
